@@ -314,44 +314,50 @@ func (c *PgEdge) Version() (version int, dirty bool, err error) {
 }
 
 func (c *PgEdge) Drop() (err error) {
-	query := `SELECT table_name FROM information_schema.tables WHERE table_schema=(SELECT current_schema()) AND table_type='BASE TABLE'`
-	tables, err := c.db.Query(query)
-	if err != nil {
-		return &database.Error{OrigErr: err, Query: []byte(query)}
-	}
-	defer func() {
-		if errClose := tables.Close(); errClose != nil {
-			err = multierror.Append(err, errClose)
-		}
-	}()
+    query := `SELECT table_schema, table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema','spock') AND table_schema NOT LIKE 'pg_toast%';`
+    rows, err := c.db.Query(query)
+    if err != nil {
+        return &database.Error{OrigErr: err, Query: []byte(query)}
+    }
+    defer func() {
+        if errClose := rows.Close(); errClose != nil {
+            err = multierror.Append(err, errClose)
+        }
+    }()
 
-	// delete one table after another
-	tableNames := make([]string, 0)
-	for tables.Next() {
-		var tableName string
-		if err := tables.Scan(&tableName); err != nil {
-			return err
-		}
-		if len(tableName) > 0 {
-			tableNames = append(tableNames, tableName)
-		}
-	}
-	if err := tables.Err(); err != nil {
-		return &database.Error{OrigErr: err, Query: []byte(query)}
-	}
+    // Store schema and table names
+    tables := make([]struct {
+        Schema string
+        Table  string
+    }, 0)
 
-	if len(tableNames) > 0 {
-		for _, t := range tableNames {
-			query = `DROP TABLE IF EXISTS ` + t + ` CASCADE`
-			fmt.Println(query,"query",t)
-			if _, err := c.db.Exec(query); err != nil {
-				return &database.Error{OrigErr: err, Query: []byte(query)}
-			}
-		}
-	}
+    for rows.Next() {
+        var schema, table string
+        if err := rows.Scan(&schema, &table); err != nil {
+            return err
+        }
+        tables = append(tables, struct {
+            Schema string
+            Table  string
+        }{Schema: schema, Table: table})
+    }
+    if err := rows.Err(); err != nil {
+        return &database.Error{OrigErr: err, Query: []byte(query)}
+    }
 
-	return nil
+    // Drop each table
+    for _, t := range tables {
+        query = `select spock.replicate_ddl('DROP TABLE IF EXISTS ` + t.Schema + `.` + t.Table + ` CASCADE;')`
+        fmt.Println(query, "query", t.Table, "schema", t.Schema) // log the schema name here
+        if _, err := c.db.Exec(query); err != nil {
+            return &database.Error{OrigErr: err, Query: []byte(query)}
+        }
+    }
+
+    return nil
 }
+
+
 
 // ensureVersionTable checks if versions table exists and, if not, creates it.
 // Note that this function locks the database

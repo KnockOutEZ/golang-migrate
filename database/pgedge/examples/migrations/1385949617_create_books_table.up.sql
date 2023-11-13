@@ -1,7 +1,11 @@
--- CREATE TABLE books (
---   user_id integer,
---   name    varchar(40),
---   author  varchar(40)
--- );
+-- select spock.replicate_ddl('CREATE TABLE northwind.books (
+--   id varchar,
+--   primary key(id)
+-- );');
 
-select spock.replicate_ddl('create table northwind.books(id varchar, primary key(id));');
+CREATE TABLE northwind.books (
+  id varchar,
+  primary key(id)
+);
+
+-- select spock.replicate_ddl('create table books(id varchar, primary key(id));');

@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"net/url"
+
 	// "regexp"
 	"strconv"
 	"time"
@@ -261,6 +263,7 @@ func (c *PgEdge) Run(migration io.Reader) error {
 
 	// run migration
 	query := string(migr[:])
+	fmt.Println(query,"query")
 	if _, err := c.db.Exec(query); err != nil {
 		return database.Error{OrigErr: err, Err: "migration failed", Query: migr}
 	}
@@ -340,6 +343,7 @@ func (c *PgEdge) Drop() (err error) {
 	if len(tableNames) > 0 {
 		for _, t := range tableNames {
 			query = `DROP TABLE IF EXISTS ` + t + ` CASCADE`
+			fmt.Println(query,"query",t)
 			if _, err := c.db.Exec(query); err != nil {
 				return &database.Error{OrigErr: err, Query: []byte(query)}
 			}

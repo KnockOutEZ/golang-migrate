@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+
 	// "strings"
 	"testing"
 	"time"
@@ -70,7 +71,7 @@ func createDB(t *testing.T, c dktest.ContainerInfo) {
 
 	//replace
 	// db, err := sql.Open("postgres", fmt.Sprintf("postgres://yugabyte:yugabyte@%v:%v?sslmode=disable", ip, port))
-	db, err := sql.Open("postgres", "postgresql://admin:Z00Wahk3M91ET63k3D2Wx6sP@eagerly-communal-goshawk-dsm.pgedge.io/golang_migrate_test_1?sslmode=verify-full")
+	db, err := sql.Open("postgres", "postgresql://admin:X5b0zmLSq0Y03Ep6q0Xf52b0@closely-crucial-ox-dsm.pgedge.io/golang_migrate_test_1?sslmode=verify-full")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +94,7 @@ func getConnectionString(ip, port string, options ...string) string {
 
 	// replace
 	// return fmt.Sprintf("yugabyte://yugabyte:yugabyte@%v:%v/migrate?%s", ip, port, strings.Join(options, "&"))
-	return "postgresql://admin:Z00Wahk3M91ET63k3D2Wx6sP@eagerly-communal-goshawk-dsm.pgedge.io/golang_migrate_test_1?sslmode=verify-full"
+	return "postgresql://admin:X5b0zmLSq0Y03Ep6q0Xf52b0@closely-crucial-ox-dsm.pgedge.io/golang_migrate_test_1?sslmode=verify-full"
 }
 
 // func Test(t *testing.T) {
@@ -118,38 +119,38 @@ func getConnectionString(ip, port string, options ...string) string {
 func TestMigrate(t *testing.T) {
 	// replace
 	// dktesting.ParallelTest(t, specs, func(t *testing.T, ci dktest.ContainerInfo) {
-		// createDB(t, ci)
-		createDB(t, dktest.ContainerInfo{})
-		fmt.Println("im here")
+	// createDB(t, ci)
+	createDB(t, dktest.ContainerInfo{})
+	fmt.Println("im here")
 
-		// ip, port, err := ci.Port(defaultPort)
-		// if err != nil {
-		// 	t.Fatal(err)
-		// }
+	// ip, port, err := ci.Port(defaultPort)
+	// if err != nil {
+	// 	t.Fatal(err)
+	// }
 
-		// addr := getConnectionString(ip, port)
-		addr := getConnectionString("", "")
-		c := &PgEdge{}
-		d, err := c.Open(addr)
-		if err != nil {
-			t.Fatal(err)
+	// addr := getConnectionString(ip, port)
+	addr := getConnectionString("", "")
+	c := &PgEdge{}
+	d, err := c.Open(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() {
+		if err := d.Close(); err != nil {
+			t.Error(err)
 		}
+	}()
 
-		defer func() {
-			if err := d.Close(); err != nil {
-				t.Error(err)
-			}
-		}()
+	fmt.Println("im here1", d)
 
-		fmt.Println("im here1", d)
-
-		m, err := migrate.NewWithDatabaseInstance("file://./examples/migrations", "postgres", d)
-		if err != nil {
-			t.Fatal(err)
-		}
-		fmt.Println("im here2")
-		dt.TestMigrate(t, m)
-		fmt.Println("im here3")
+	m, err := migrate.NewWithDatabaseInstance("file://./examples/migrations", "postgres", d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println("im here2")
+	dt.TestMigrate(t, m)
+	fmt.Println("im here3")
 
 	// })
 }

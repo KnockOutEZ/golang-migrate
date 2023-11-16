@@ -190,7 +190,6 @@ func (c *PgEdge) Close() error {
 }
 
 // Locking is done manually with a separate lock table. Implementing advisory locks in PgEdge is being discussed
-// See: https://github.com/yugabyte/yugabyte-db/issues/3642
 func (c *PgEdge) Lock() error {
 	return database.CasRestoreOnErr(&c.isLocked, false, true, database.ErrLocked, func() (err error) {
 		return c.doTxWithRetry(context.Background(), &sql.TxOptions{Isolation: sql.LevelSerializable}, func(tx *sql.Tx) (err error) {
@@ -227,7 +226,6 @@ func (c *PgEdge) Lock() error {
 }
 
 // Locking is done manually with a separate lock table. Implementing advisory locks in PgEdge is being discussed
-// See: https://github.com/yugabyte/yugabyte-db/issues/3642
 func (c *PgEdge) Unlock() error {
 	return database.CasRestoreOnErr(&c.isLocked, true, false, database.ErrNotLocked, func() (err error) {
 		aid, err := database.GenerateAdvisoryLockId(c.config.DatabaseName)
@@ -241,7 +239,6 @@ func (c *PgEdge) Unlock() error {
 		if _, err := c.db.Exec(query, aid); err != nil {
 			if e, ok := err.(*pq.Error); ok {
 				// 42P01 is "UndefinedTableError" in PgEdge
-				// https://github.com/yugabyte/yugabyte-db/blob/9c6b8e6beb56eed8eeb357178c0c6b837eb49896/src/postgres/src/backend/utils/errcodes.txt#L366
 				if e.Code == "42P01" {
 					// On drops, the lock table is fully removed; This is fine, and is a valid "unlocked" state for the schema
 					return nil
@@ -301,7 +298,6 @@ func (c *PgEdge) Version() (version int, dirty bool, err error) {
 	case err != nil:
 		if e, ok := err.(*pq.Error); ok {
 			// 42P01 is "UndefinedTableError" in PgEdge
-			// https://github.com/yugabyte/yugabyte-db/blob/9c6b8e6beb56eed8eeb357178c0c6b837eb49896/src/postgres/src/backend/utils/errcodes.txt#L366
 			if e.Code == "42P01" {
 				return database.NilVersion, false, nil
 			}

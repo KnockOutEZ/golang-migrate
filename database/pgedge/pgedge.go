@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"regexp"
 
 	// "regexp"
 	"strconv"
@@ -127,10 +128,10 @@ func (c *PgEdge) Open(dbURL string) (database.Driver, error) {
 
 	// As PgEdge uses the postgres protocol, and 'postgres' is already a registered database, we need to replace the
 	// connect prefix, with the actual protocol, so that the library can differentiate between the implementations
-	// re := regexp.MustCompile("^(pgedge)")
-	// connectString := re.ReplaceAllString(migrate.FilterCustomQuery(purl).String(), "postgres")
+	re := regexp.MustCompile("^(pgedge)")
+	connectString := re.ReplaceAllString(migrate.FilterCustomQuery(purl).String(), "postgres")
 
-	db, err := sql.Open("postgres", migrate.FilterCustomQuery(purl).String())
+	db, err := sql.Open("postgres", connectString)
 	if err != nil {
 		return nil, err
 	}

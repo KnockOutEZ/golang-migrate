@@ -193,6 +193,7 @@ func (c *PgEdge) Close() error {
 func (c *PgEdge) Lock() error {
 	return database.CasRestoreOnErr(&c.isLocked, false, true, database.ErrLocked, func() (err error) {
 		return c.doTxWithRetry(context.Background(), &sql.TxOptions{Isolation: sql.LevelSerializable}, func(tx *sql.Tx) (err error) {
+			fmt.Println("Lock() is called")
 			aid, err := database.GenerateAdvisoryLockId(c.config.DatabaseName)
 			if err != nil {
 				return err
@@ -215,7 +216,7 @@ func (c *PgEdge) Lock() error {
 				return database.ErrLocked
 			}
 
-			query = "INSERT INTO " + c.config.LockTable + " (lock_id) VALUES ($1)"
+			query = `select spock.replicate_ddl('INSERT INTO ` + c.config.LockTable +  ` (lock_id) VALUES ($1)')`
 			if _, err := tx.Exec(query, aid); err != nil {
 				return database.Error{OrigErr: err, Err: "failed to set migration lock", Query: []byte(query)}
 			}
@@ -228,6 +229,7 @@ func (c *PgEdge) Lock() error {
 // Locking is done manually with a separate lock table. Implementing advisory locks in PgEdge is being discussed
 func (c *PgEdge) Unlock() error {
 	return database.CasRestoreOnErr(&c.isLocked, true, false, database.ErrNotLocked, func() (err error) {
+		fmt.Println("Unlock() is called")
 		aid, err := database.GenerateAdvisoryLockId(c.config.DatabaseName)
 		if err != nil {
 			return err
@@ -235,7 +237,7 @@ func (c *PgEdge) Unlock() error {
 
 		// In the event of an implementation (non-migration) error, it is possible for the lock to not be released. Until
 		// a better locking mechanism is added, a manual purging of the lock table may be required in such circumstances
-		query := "DELETE FROM " + c.config.LockTable + " WHERE lock_id = $1"
+		query := `select spock.replicate_ddl('DELETE FROM ` + c.config.LockTable + ` WHERE lock_id = $1')`
 		if _, err := c.db.Exec(query, aid); err != nil {
 			if e, ok := err.(*pq.Error); ok {
 				// 42P01 is "UndefinedTableError" in PgEdge
@@ -253,6 +255,7 @@ func (c *PgEdge) Unlock() error {
 }
 
 func (c *PgEdge) Run(migration io.Reader) error {
+	fmt.Println("Run() is called")
 	migr, err := io.ReadAll(migration)
 	if err != nil {
 		return err
@@ -261,6 +264,7 @@ func (c *PgEdge) Run(migration io.Reader) error {
 	// run migration
 	query := string(migr[:])
 	fmt.Println(query,"query")
+
 	if _, err := c.db.Exec(query); err != nil {
 		return database.Error{OrigErr: err, Err: "migration failed", Query: migr}
 	}
@@ -270,7 +274,8 @@ func (c *PgEdge) Run(migration io.Reader) error {
 
 func (c *PgEdge) SetVersion(version int, dirty bool) error {
 	return c.doTxWithRetry(context.Background(), &sql.TxOptions{Isolation: sql.LevelSerializable}, func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`DELETE FROM "` + c.config.MigrationsTable + `"`); err != nil {
+		fmt.Println("SetVersion() is called")
+		if _, err := tx.Exec(`select spock.replicate_ddl('DELETE FROM ` + c.config.MigrationsTable + `')`); err != nil {
 			return err
 		}
 
@@ -278,7 +283,7 @@ func (c *PgEdge) SetVersion(version int, dirty bool) error {
 		// empty schema version for failed down migration on the first migration
 		// See: https://github.com/golang-migrate/migrate/issues/330
 		if version >= 0 || (version == database.NilVersion && dirty) {
-			if _, err := tx.Exec(`INSERT INTO "`+c.config.MigrationsTable+`" (version, dirty) VALUES ($1, $2)`, version, dirty); err != nil {
+			if _, err := tx.Exec(`select spock.replicate_ddl('INSERT INTO `+ c.config.MigrationsTable +` (version, dirty) VALUES ($1, $2)')`, version, dirty); err != nil {
 				return err
 			}
 		}
@@ -288,6 +293,7 @@ func (c *PgEdge) SetVersion(version int, dirty bool) error {
 }
 
 func (c *PgEdge) Version() (version int, dirty bool, err error) {
+	fmt.Println("Version() is called")
 	query := `SELECT version, dirty FROM "` + c.config.MigrationsTable + `" LIMIT 1`
 	err = c.db.QueryRow(query).Scan(&version, &dirty)
 
@@ -310,6 +316,7 @@ func (c *PgEdge) Version() (version int, dirty bool, err error) {
 }
 
 func (c *PgEdge) Drop() (err error) {
+	fmt.Println("Drop() is called")
     query := `SELECT table_schema, table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema','spock') AND table_schema NOT LIKE 'pg_toast%';`
     rows, err := c.db.Query(query)
     if err != nil {
@@ -358,6 +365,7 @@ func (c *PgEdge) Drop() (err error) {
 // ensureVersionTable checks if versions table exists and, if not, creates it.
 // Note that this function locks the database
 func (c *PgEdge) ensureVersionTable() (err error) {
+	fmt.Println("ensureVersionTable() is called")
 	if err = c.Lock(); err != nil {
 		return err
 	}
@@ -383,7 +391,7 @@ func (c *PgEdge) ensureVersionTable() (err error) {
 	}
 
 	// if not, create the empty migration table
-	query = `CREATE TABLE "` + c.config.MigrationsTable + `" (version INT NOT NULL PRIMARY KEY, dirty BOOL NOT NULL)`
+	query = `select spock.replicate_ddl('CREATE TABLE ` + c.config.MigrationsTable + ` (version INT NOT NULL PRIMARY KEY, dirty BOOL NOT NULL)')`
 	if _, err := c.db.Exec(query); err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
@@ -391,6 +399,7 @@ func (c *PgEdge) ensureVersionTable() (err error) {
 }
 
 func (c *PgEdge) ensureLockTable() error {
+	fmt.Println("ensureLockTable() is called")
 	// check if lock table exists
 	var count int
 	query := `SELECT COUNT(1) FROM information_schema.tables WHERE table_name = $1 AND table_schema = (SELECT current_schema()) LIMIT 1`
@@ -402,7 +411,7 @@ func (c *PgEdge) ensureLockTable() error {
 	}
 
 	// if not, create the empty lock table
-	query = `CREATE TABLE "` + c.config.LockTable + `" (lock_id TEXT NOT NULL PRIMARY KEY)`
+	query = `select spock.replicate_ddl('CREATE TABLE ` + c.config.LockTable + ` (lock_id TEXT NOT NULL PRIMARY KEY)')`
 	if _, err := c.db.Exec(query); err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
@@ -415,6 +424,7 @@ func (c *PgEdge) doTxWithRetry(
 	txOpts *sql.TxOptions,
 	fn func(tx *sql.Tx) error,
 ) error {
+	fmt.Println("doTxWithRetry() is called")
 	backOff := c.newBackoff(ctx)
 
 	return backoff.Retry(func() error {

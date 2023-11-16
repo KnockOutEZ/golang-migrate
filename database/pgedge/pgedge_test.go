@@ -98,22 +98,25 @@ func getConnectionString(ip, port string, options ...string) string {
 }
 
 // func Test(t *testing.T) {
-// 	dktesting.ParallelTest(t, specs, func(t *testing.T, ci dktest.ContainerInfo) {
-// 		createDB(t, ci)
+// 	// replace
+// 	// dktesting.ParallelTest(t, specs, func(t *testing.T, ci dktest.ContainerInfo) {
+// 	// createDB(t, ci)
+// 	createDB(t, dktest.ContainerInfo{})
 
-// 		ip, port, err := ci.Port(defaultPort)
-// 		if err != nil {
-// 			t.Fatal(err)
-// 		}
+// 		// ip, port, err := ci.Port(defaultPort)
+// 		// if err != nil {
+// 		// 	t.Fatal(err)
+// 		// }
 
-// 		addr := getConnectionString(ip, port)
+// 		// addr := getConnectionString(ip, port)
+// 		addr := getConnectionString("", "")
 // 		c := &PgEdge{}
 // 		d, err := c.Open(addr)
 // 		if err != nil {
 // 			t.Fatal(err)
 // 		}
 // 		dt.Test(t, d, []byte("SELECT 1"))
-// 	})
+// 	// })
 // }
 
 func TestMigrate(t *testing.T) {

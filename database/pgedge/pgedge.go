@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/url"
 	"regexp"
+	"strings"
 
 	// "regexp"
 	"strconv"
@@ -61,6 +62,7 @@ type PgEdge struct {
 }
 
 func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
+	fmt.Println("WithInstance() is called")
 	if config == nil {
 		return nil, ErrNilConfig
 	}
@@ -79,6 +81,8 @@ func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
 		if len(databaseName) == 0 {
 			return nil, ErrNoDatabaseName
 		}
+
+		fmt.Println("databaseName", databaseName)
 
 		config.DatabaseName = databaseName
 	}
@@ -217,7 +221,7 @@ func (c *PgEdge) Lock() error {
 				return database.ErrLocked
 			}
 
-			query = `select spock.replicate_ddl('INSERT INTO ` + c.config.LockTable +  ` (lock_id) VALUES ($1)')`
+			query = `INSERT INTO "` + c.config.LockTable + `" (lock_id) VALUES ($1)`
 			if _, err := tx.Exec(query, aid); err != nil {
 				return database.Error{OrigErr: err, Err: "failed to set migration lock", Query: []byte(query)}
 			}
@@ -238,7 +242,7 @@ func (c *PgEdge) Unlock() error {
 
 		// In the event of an implementation (non-migration) error, it is possible for the lock to not be released. Until
 		// a better locking mechanism is added, a manual purging of the lock table may be required in such circumstances
-		query := `select spock.replicate_ddl('DELETE FROM ` + c.config.LockTable + ` WHERE lock_id = $1')`
+		query := `DELETE FROM "` + c.config.LockTable + `" WHERE lock_id = $1`
 		if _, err := c.db.Exec(query, aid); err != nil {
 			if e, ok := err.(*pq.Error); ok {
 				// 42P01 is "UndefinedTableError" in PgEdge
@@ -263,11 +267,38 @@ func (c *PgEdge) Run(migration io.Reader) error {
 	}
 
 	// run migration
-	query := string(migr[:])
-	fmt.Println(query,"query")
+	
+	// Split the migration into individual statements
+	statements := strings.Split(string(migr), ";")
 
-	if _, err := c.db.Exec(query); err != nil {
-		return database.Error{OrigErr: err, Err: "migration failed", Query: migr}
+	for _, stmt := range statements {
+		// Trim whitespace
+		stmt = strings.TrimSpace(stmt)
+
+		// Skip empty statements and comments
+		if stmt == "" || strings.HasPrefix(stmt, "--") {
+			continue
+		}
+
+		// Check if schema name is present
+		schemaPresent, err := regexp.MatchString(`\w+\.\w+`, stmt)
+		if err != nil {
+			return err
+		}
+
+		// If schema name is not present, prepend default schema to table name
+		if !schemaPresent {
+			stmt = strings.Replace(stmt, "TABLE ", fmt.Sprintf("TABLE %s.", "public"), 1)
+		}
+
+		// Wrap the statement with spock.replicate_ddl
+		query := fmt.Sprintf("SELECT spock.replicate_ddl('%s');", stmt)
+		fmt.Println(query, "query")
+
+		// Run the query
+		if _, err := c.db.Exec(query); err != nil {
+			return database.Error{OrigErr: err, Err: "migration failed", Query: []byte(query)}
+		}
 	}
 
 	return nil
@@ -276,7 +307,7 @@ func (c *PgEdge) Run(migration io.Reader) error {
 func (c *PgEdge) SetVersion(version int, dirty bool) error {
 	return c.doTxWithRetry(context.Background(), &sql.TxOptions{Isolation: sql.LevelSerializable}, func(tx *sql.Tx) error {
 		fmt.Println("SetVersion() is called")
-		if _, err := tx.Exec(`select spock.replicate_ddl('DELETE FROM ` + c.config.MigrationsTable + `')`); err != nil {
+		if _, err := tx.Exec(`DELETE FROM "` + c.config.MigrationsTable + `"`); err != nil {
 			return err
 		}
 
@@ -284,7 +315,7 @@ func (c *PgEdge) SetVersion(version int, dirty bool) error {
 		// empty schema version for failed down migration on the first migration
 		// See: https://github.com/golang-migrate/migrate/issues/330
 		if version >= 0 || (version == database.NilVersion && dirty) {
-			if _, err := tx.Exec(`select spock.replicate_ddl('INSERT INTO `+ c.config.MigrationsTable +` (version, dirty) VALUES ($1, $2)')`, version, dirty); err != nil {
+			if _, err := tx.Exec(`INSERT INTO "`+c.config.MigrationsTable+`" (version, dirty) VALUES ($1, $2)`, version, dirty); err != nil {
 				return err
 			}
 		}
@@ -318,50 +349,48 @@ func (c *PgEdge) Version() (version int, dirty bool, err error) {
 
 func (c *PgEdge) Drop() (err error) {
 	fmt.Println("Drop() is called")
-    query := `SELECT table_schema, table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema','spock') AND table_schema NOT LIKE 'pg_toast%';`
-    rows, err := c.db.Query(query)
-    if err != nil {
-        return &database.Error{OrigErr: err, Query: []byte(query)}
-    }
-    defer func() {
-        if errClose := rows.Close(); errClose != nil {
-            err = multierror.Append(err, errClose)
-        }
-    }()
+	query := `SELECT table_schema, table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema','spock') AND table_schema NOT LIKE 'pg_toast%';`
+	rows, err := c.db.Query(query)
+	if err != nil {
+		return &database.Error{OrigErr: err, Query: []byte(query)}
+	}
+	defer func() {
+		if errClose := rows.Close(); errClose != nil {
+			err = multierror.Append(err, errClose)
+		}
+	}()
 
-    // Store schema and table names
-    tables := make([]struct {
-        Schema string
-        Table  string
-    }, 0)
+	// Store schema and table names
+	tables := make([]struct {
+		Schema string
+		Table  string
+	}, 0)
 
-    for rows.Next() {
-        var schema, table string
-        if err := rows.Scan(&schema, &table); err != nil {
-            return err
-        }
-        tables = append(tables, struct {
-            Schema string
-            Table  string
-        }{Schema: schema, Table: table})
-    }
-    if err := rows.Err(); err != nil {
-        return &database.Error{OrigErr: err, Query: []byte(query)}
-    }
+	for rows.Next() {
+		var schema, table string
+		if err := rows.Scan(&schema, &table); err != nil {
+			return err
+		}
+		tables = append(tables, struct {
+			Schema string
+			Table  string
+		}{Schema: schema, Table: table})
+	}
+	if err := rows.Err(); err != nil {
+		return &database.Error{OrigErr: err, Query: []byte(query)}
+	}
 
-    // Drop each table
-    for _, t := range tables {
-        query = `select spock.replicate_ddl('DROP TABLE IF EXISTS ` + t.Schema + `.` + t.Table + `;')` //CASCADE
-        fmt.Println(query, "query", t.Table, "schema", t.Schema) // log the schema name here
-        if _, err := c.db.Exec(query); err != nil {
-            return &database.Error{OrigErr: err, Query: []byte(query)}
-        }
-    }
+	// Drop each table
+	for _, t := range tables {
+		query = `select spock.replicate_ddl('DROP TABLE IF EXISTS ` + t.Schema + `.` + t.Table + `;')` //CASCADE
+		fmt.Println(query, "query", t.Table, "schema", t.Schema)                                       // log the schema name here
+		if _, err := c.db.Exec(query); err != nil {
+			return &database.Error{OrigErr: err, Query: []byte(query)}
+		}
+	}
 
-    return nil
+	return nil
 }
-
-
 
 // ensureVersionTable checks if versions table exists and, if not, creates it.
 // Note that this function locks the database
@@ -392,7 +421,7 @@ func (c *PgEdge) ensureVersionTable() (err error) {
 	}
 
 	// if not, create the empty migration table
-	query = `select spock.replicate_ddl('CREATE TABLE ` + c.config.MigrationsTable + ` (version INT NOT NULL PRIMARY KEY, dirty BOOL NOT NULL)')`
+	query = `CREATE TABLE "` + c.config.MigrationsTable + `" (version INT NOT NULL PRIMARY KEY, dirty BOOL NOT NULL)`
 	if _, err := c.db.Exec(query); err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
@@ -412,7 +441,7 @@ func (c *PgEdge) ensureLockTable() error {
 	}
 
 	// if not, create the empty lock table
-	query = `select spock.replicate_ddl('CREATE TABLE ` + c.config.LockTable + ` (lock_id TEXT NOT NULL PRIMARY KEY)')`
+	query = `CREATE TABLE "` + c.config.LockTable + `" (lock_id TEXT NOT NULL PRIMARY KEY)`
 	if _, err := c.db.Exec(query); err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}

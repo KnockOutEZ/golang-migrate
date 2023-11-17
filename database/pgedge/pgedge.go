@@ -14,27 +14,32 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
+	// "github.com/cenkalti/backoff/v4"
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database"
+	"github.com/golang-migrate/migrate/v4/database/multistmt"
 	"github.com/hashicorp/go-multierror"
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgerrcode"
+
+	// "github.com/jackc/pgconn"
+	// "github.com/jackc/pgerrcode"
 	"github.com/lib/pq"
 	"go.uber.org/atomic"
 )
 
-const (
-	DefaultMaxRetryInterval    = time.Second * 15
-	DefaultMaxRetryElapsedTime = time.Second * 30
-	DefaultMaxRetries          = 10
-	DefaultMigrationsTable     = "migrations"
-	DefaultLockTable           = "migrations_locks"
+var (
+	DefaultMaxRetryInterval      = time.Second * 15
+	DefaultMaxRetryElapsedTime   = time.Second * 30
+	DefaultMaxRetries            = 10
+	DefaultMigrationsTable       = "migrations"
+	DefaultMultiStatementMaxSize = 10 * 1 << 20 // 10 MB
+	multiStmtDelimiter           = []byte(";")
+	// DefaultLockTable           = "migrations_locks"
 )
 
 var (
 	ErrNilConfig          = errors.New("no config")
 	ErrNoDatabaseName     = errors.New("no database name")
+	ErrNoSchema           = errors.New("no schema")
 	ErrMaxRetriesExceeded = errors.New("max retries exceeded")
 )
 
@@ -44,16 +49,19 @@ func init() {
 }
 
 type Config struct {
-	MigrationsTable     string
-	LockTable           string
-	ForceLock           bool
-	DatabaseName        string
-	MaxRetryInterval    time.Duration
-	MaxRetryElapsedTime time.Duration
-	MaxRetries          int
+	MigrationsTable       string
+	MigrationsTableQuoted bool
+	MultiStatementEnabled bool
+	DatabaseName          string
+	SchemaName            string
+	migrationsSchemaName  string
+	migrationsTableName   string
+	StatementTimeout      time.Duration
+	MultiStatementMaxSize int
 }
 
 type PgEdge struct {
+	conn     *sql.Conn
 	db       *sql.DB
 	isLocked atomic.Bool
 
@@ -61,20 +69,19 @@ type PgEdge struct {
 	config *Config
 }
 
-func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
-	fmt.Println("WithInstance() is called")
+func WithConnection(ctx context.Context, conn *sql.Conn, config *Config) (*PgEdge, error) {
 	if config == nil {
 		return nil, ErrNilConfig
 	}
 
-	if err := instance.Ping(); err != nil {
+	if err := conn.PingContext(ctx); err != nil {
 		return nil, err
 	}
 
 	if config.DatabaseName == "" {
-		query := `SELECT current_database()`
+		query := `SELECT CURRENT_DATABASE()`
 		var databaseName string
-		if err := instance.QueryRow(query).Scan(&databaseName); err != nil {
+		if err := conn.QueryRowContext(ctx, query).Scan(&databaseName); err != nil {
 			return nil, &database.Error{OrigErr: err, Query: []byte(query)}
 		}
 
@@ -82,39 +89,43 @@ func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
 			return nil, ErrNoDatabaseName
 		}
 
-		fmt.Println("databaseName", databaseName)
-
 		config.DatabaseName = databaseName
+	}
+
+	if config.SchemaName == "" {
+		query := `SELECT CURRENT_SCHEMA()`
+		var schemaName sql.NullString
+		if err := conn.QueryRowContext(ctx, query).Scan(&schemaName); err != nil {
+			return nil, &database.Error{OrigErr: err, Query: []byte(query)}
+		}
+
+		if !schemaName.Valid {
+			return nil, ErrNoSchema
+		}
+
+		config.SchemaName = schemaName.String
 	}
 
 	if len(config.MigrationsTable) == 0 {
 		config.MigrationsTable = DefaultMigrationsTable
 	}
 
-	if len(config.LockTable) == 0 {
-		config.LockTable = DefaultLockTable
-	}
-
-	if config.MaxRetryInterval == 0 {
-		config.MaxRetryInterval = DefaultMaxRetryInterval
-	}
-
-	if config.MaxRetryElapsedTime == 0 {
-		config.MaxRetryElapsedTime = DefaultMaxRetryElapsedTime
-	}
-
-	if config.MaxRetries == 0 {
-		config.MaxRetries = DefaultMaxRetries
+	config.migrationsSchemaName = config.SchemaName
+	config.migrationsTableName = config.MigrationsTable
+	if config.MigrationsTableQuoted {
+		re := regexp.MustCompile(`"(.*?)"`)
+		result := re.FindAllStringSubmatch(config.MigrationsTable, -1)
+		config.migrationsTableName = result[len(result)-1][1]
+		if len(result) == 2 {
+			config.migrationsSchemaName = result[0][1]
+		} else if len(result) > 2 {
+			return nil, fmt.Errorf("\"%s\" MigrationsTable contains too many dot characters", config.MigrationsTable)
+		}
 	}
 
 	px := &PgEdge{
-		db:     instance,
+		conn:   conn,
 		config: config,
-	}
-
-	// ensureVersionTable is a locking operation, so we need to ensureLockTable before we ensureVersionTable.
-	if err := px.ensureLockTable(); err != nil {
-		return nil, err
 	}
 
 	if err := px.ensureVersionTable(); err != nil {
@@ -124,7 +135,27 @@ func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
 	return px, nil
 }
 
-func (c *PgEdge) Open(dbURL string) (database.Driver, error) {
+func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
+	ctx := context.Background()
+
+	if err := instance.Ping(); err != nil {
+		return nil, err
+	}
+
+	conn, err := instance.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	px, err := WithConnection(ctx, conn, config)
+	if err != nil {
+		return nil, err
+	}
+	px.db = instance
+	return px, nil
+}
+
+func (p *PgEdge) Open(dbURL string) (database.Driver, error) {
 	purl, err := url.Parse(dbURL)
 	if err != nil {
 		return nil, err
@@ -141,48 +172,54 @@ func (c *PgEdge) Open(dbURL string) (database.Driver, error) {
 	}
 
 	migrationsTable := purl.Query().Get("x-migrations-table")
-	if len(migrationsTable) == 0 {
-		migrationsTable = DefaultMigrationsTable
+	migrationsTableQuoted := false
+	if s := purl.Query().Get("x-migrations-table-quoted"); len(s) > 0 {
+		migrationsTableQuoted, err = strconv.ParseBool(s)
+		if err != nil {
+			return nil, fmt.Errorf("Unable to parse option x-migrations-table-quoted: %w", err)
+		}
+	}
+	if (len(migrationsTable) > 0) && (migrationsTableQuoted) && ((migrationsTable[0] != '"') || (migrationsTable[len(migrationsTable)-1] != '"')) {
+		return nil, fmt.Errorf("x-migrations-table must be quoted (for instance '\"migrate\".\"schema_migrations\"') when x-migrations-table-quoted is enabled, current value is: %s", migrationsTable)
 	}
 
-	lockTable := purl.Query().Get("x-lock-table")
-	if len(lockTable) == 0 {
-		lockTable = DefaultLockTable
+	statementTimeoutString := purl.Query().Get("x-statement-timeout")
+	statementTimeout := 0
+	if statementTimeoutString != "" {
+		statementTimeout, err = strconv.Atoi(statementTimeoutString)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	forceLockQuery := purl.Query().Get("x-force-lock")
-	forceLock, err := strconv.ParseBool(forceLockQuery)
-	if err != nil {
-		forceLock = false
+	multiStatementMaxSize := DefaultMultiStatementMaxSize
+	if s := purl.Query().Get("x-multi-statement-max-size"); len(s) > 0 {
+		multiStatementMaxSize, err = strconv.Atoi(s)
+		if err != nil {
+			return nil, err
+		}
+		if multiStatementMaxSize <= 0 {
+			multiStatementMaxSize = DefaultMultiStatementMaxSize
+		}
 	}
 
-	maxIntervalStr := purl.Query().Get("x-max-retry-interval")
-	maxInterval, err := time.ParseDuration(maxIntervalStr)
-	if err != nil {
-		maxInterval = DefaultMaxRetryInterval
-	}
-
-	maxElapsedTimeStr := purl.Query().Get("x-max-retry-elapsed-time")
-	maxElapsedTime, err := time.ParseDuration(maxElapsedTimeStr)
-	if err != nil {
-		maxElapsedTime = DefaultMaxRetryElapsedTime
-	}
-
-	maxRetriesStr := purl.Query().Get("x-max-retries")
-	maxRetries, err := strconv.Atoi(maxRetriesStr)
-	if err != nil {
-		maxRetries = DefaultMaxRetries
+	multiStatementEnabled := false
+	if s := purl.Query().Get("x-multi-statement"); len(s) > 0 {
+		multiStatementEnabled, err = strconv.ParseBool(s)
+		if err != nil {
+			return nil, fmt.Errorf("Unable to parse option x-multi-statement: %w", err)
+		}
 	}
 
 	px, err := WithInstance(db, &Config{
-		DatabaseName:        purl.Path,
-		MigrationsTable:     migrationsTable,
-		LockTable:           lockTable,
-		ForceLock:           forceLock,
-		MaxRetryInterval:    maxInterval,
-		MaxRetryElapsedTime: maxElapsedTime,
-		MaxRetries:          maxRetries,
+		DatabaseName:          purl.Path,
+		MigrationsTable:       migrationsTable,
+		MigrationsTableQuoted: migrationsTableQuoted,
+		StatementTimeout:      time.Duration(statementTimeout) * time.Millisecond,
+		MultiStatementEnabled: multiStatementEnabled,
+		MultiStatementMaxSize: multiStatementMaxSize,
 	})
+
 	if err != nil {
 		return nil, err
 	}
@@ -190,86 +227,151 @@ func (c *PgEdge) Open(dbURL string) (database.Driver, error) {
 	return px, nil
 }
 
-func (c *PgEdge) Close() error {
-	return c.db.Close()
+func (p *PgEdge) Close() error {
+	connErr := p.conn.Close()
+	var dbErr error
+	if p.db != nil {
+		dbErr = p.db.Close()
+	}
+
+	if connErr != nil || dbErr != nil {
+		return fmt.Errorf("conn: %v, db: %v", connErr, dbErr)
+	}
+	return nil
 }
 
 // Locking is done manually with a separate lock table. Implementing advisory locks in PgEdge is being discussed
-func (c *PgEdge) Lock() error {
-	return database.CasRestoreOnErr(&c.isLocked, false, true, database.ErrLocked, func() (err error) {
-		return c.doTxWithRetry(context.Background(), &sql.TxOptions{Isolation: sql.LevelSerializable}, func(tx *sql.Tx) (err error) {
-			fmt.Println("Lock() is called")
-			aid, err := database.GenerateAdvisoryLockId(c.config.DatabaseName)
-			if err != nil {
-				return err
-			}
-
-			query := "SELECT * FROM " + c.config.LockTable + " WHERE lock_id = $1"
-			rows, err := tx.Query(query, aid)
-			if err != nil {
-				return database.Error{OrigErr: err, Err: "failed to fetch migration lock", Query: []byte(query)}
-			}
-			defer func() {
-				if errClose := rows.Close(); errClose != nil {
-					err = multierror.Append(err, errClose)
-				}
-			}()
-
-			// If row exists at all, lock is present
-			locked := rows.Next()
-			if locked && !c.config.ForceLock {
-				return database.ErrLocked
-			}
-
-			query = `INSERT INTO "` + c.config.LockTable + `" (lock_id) VALUES ($1)`
-			if _, err := tx.Exec(query, aid); err != nil {
-				return database.Error{OrigErr: err, Err: "failed to set migration lock", Query: []byte(query)}
-			}
-
-			return nil
-		})
-	})
-}
-
-// Locking is done manually with a separate lock table. Implementing advisory locks in PgEdge is being discussed
-func (c *PgEdge) Unlock() error {
-	return database.CasRestoreOnErr(&c.isLocked, true, false, database.ErrNotLocked, func() (err error) {
-		fmt.Println("Unlock() is called")
-		aid, err := database.GenerateAdvisoryLockId(c.config.DatabaseName)
+func (p *PgEdge) Lock() error {
+	return database.CasRestoreOnErr(&p.isLocked, false, true, database.ErrLocked, func() error {
+		aid, err := database.GenerateAdvisoryLockId(p.config.DatabaseName, p.config.migrationsSchemaName, p.config.migrationsTableName)
 		if err != nil {
 			return err
 		}
 
-		// In the event of an implementation (non-migration) error, it is possible for the lock to not be released. Until
-		// a better locking mechanism is added, a manual purging of the lock table may be required in such circumstances
-		query := `DELETE FROM "` + c.config.LockTable + `" WHERE lock_id = $1`
-		if _, err := c.db.Exec(query, aid); err != nil {
-			if e, ok := err.(*pq.Error); ok {
-				// 42P01 is "UndefinedTableError" in PgEdge
-				if e.Code == "42P01" {
-					// On drops, the lock table is fully removed; This is fine, and is a valid "unlocked" state for the schema
-					return nil
-				}
-			}
-
-			return database.Error{OrigErr: err, Err: "failed to release migration lock", Query: []byte(query)}
+		// This will wait indefinitely until the lock can be acquired.
+		query := `SELECT pg_advisory_lock($1)`
+		if _, err := p.conn.ExecContext(context.Background(), query, aid); err != nil {
+			return &database.Error{OrigErr: err, Err: "try lock failed", Query: []byte(query)}
 		}
 
 		return nil
 	})
 }
 
-func (c *PgEdge) Run(migration io.Reader) error {
+// Locking is done manually with a separate lock table. Implementing advisory locks in PgEdge is being discussed
+func (p *PgEdge) Unlock() error {
+	return database.CasRestoreOnErr(&p.isLocked, true, false, database.ErrNotLocked, func() error {
+		aid, err := database.GenerateAdvisoryLockId(p.config.DatabaseName, p.config.migrationsSchemaName, p.config.migrationsTableName)
+		if err != nil {
+			return err
+		}
+
+		query := `SELECT pg_advisory_unlock($1)`
+		if _, err := p.conn.ExecContext(context.Background(), query, aid); err != nil {
+			return &database.Error{OrigErr: err, Query: []byte(query)}
+		}
+		return nil
+	})
+}
+
+func (p *PgEdge) Run(migration io.Reader) error {
 	fmt.Println("Run() is called")
+	if p.config.MultiStatementEnabled {
+		var err error
+		if e := multistmt.Parse(migration, multiStmtDelimiter, p.config.MultiStatementMaxSize, func(m []byte) bool {
+			if err = p.runStatement(m); err != nil {
+				return false
+			}
+			return true
+		}); e != nil {
+			return e
+		}
+		return err
+	}
 	migr, err := io.ReadAll(migration)
 	if err != nil {
 		return err
 	}
+	return p.runStatement(migr)
+}
 
-	// run migration
-	
-	// Split the migration into individual statements
-	statements := strings.Split(string(migr), ";")
+func (p *PgEdge) runStatement(statement []byte) error {
+	ctx := context.Background()
+	fmt.Println("runStatement() is called")
+	if p.config.StatementTimeout != 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, p.config.StatementTimeout)
+		defer cancel()
+	}
+
+	query := string(statement)
+	if strings.TrimSpace(query) == "" {
+		return nil
+	}
+
+	fmt.Println(query, "query")
+	fmt.Println(p.config.migrationsSchemaName, "migrationsSchemaName")
+	if _, err := p.conn.ExecContext(ctx, query); err != nil {
+		if pgErr, ok := err.(*pq.Error); ok {
+			var line uint
+			var col uint
+			var lineColOK bool
+			if pgErr.Position != "" {
+				if pos, err := strconv.ParseUint(pgErr.Position, 10, 64); err == nil {
+					line, col, lineColOK = computeLineFromPos(query, int(pos))
+				}
+			}
+			message := fmt.Sprintf("migration failed: %s", pgErr.Message)
+			if lineColOK {
+				message = fmt.Sprintf("%s (column %d)", message, col)
+			}
+			if pgErr.Detail != "" {
+				message = fmt.Sprintf("%s, %s", message, pgErr.Detail)
+			}
+			return database.Error{OrigErr: err, Err: message, Query: statement, Line: line}
+		}
+		return database.Error{OrigErr: err, Err: "migration failed", Query: statement}
+	}
+	return nil
+}
+
+func computeLineFromPos(s string, pos int) (line uint, col uint, ok bool) {
+	// replace crlf with lf
+	s = strings.Replace(s, "\r\n", "\n", -1)
+	// pg docs: pos uses index 1 for the first character, and positions are measured in characters not bytes
+	runes := []rune(s)
+	if pos > len(runes) {
+		return 0, 0, false
+	}
+	sel := runes[:pos]
+	line = uint(runesCount(sel, newLine) + 1)
+	col = uint(pos - 1 - runesLastIndex(sel, newLine))
+	return line, col, true
+}
+
+const newLine = '\n'
+
+func runesCount(input []rune, target rune) int {
+	var count int
+	for _, r := range input {
+		if r == target {
+			count++
+		}
+	}
+	return count
+}
+
+func runesLastIndex(input []rune, target rune) int {
+	for i := len(input) - 1; i >= 0; i-- {
+		if input[i] == target {
+			return i
+		}
+	}
+	return -1
+}
+
+func filterQuery(query string)(string, error){
+	statements := strings.Split(query, ";")
 
 	for _, stmt := range statements {
 		// Trim whitespace
@@ -295,48 +397,53 @@ func (c *PgEdge) Run(migration io.Reader) error {
 		query := fmt.Sprintf("SELECT spock.replicate_ddl('%s');", stmt)
 		fmt.Println(query, "query")
 
-		// Run the query
-		if _, err := c.db.Exec(query); err != nil {
-			return database.Error{OrigErr: err, Err: "migration failed", Query: []byte(query)}
+}
+}
+
+func (p *PgEdge) SetVersion(version int, dirty bool) error {
+	tx, err := p.conn.BeginTx(context.Background(), &sql.TxOptions{})
+	if err != nil {
+		return &database.Error{OrigErr: err, Err: "transaction start failed"}
+	}
+
+	query := `TRUNCATE ` + pq.QuoteIdentifier(p.config.migrationsSchemaName) + `.` + pq.QuoteIdentifier(p.config.migrationsTableName)
+	if _, err := tx.Exec(query); err != nil {
+		if errRollback := tx.Rollback(); errRollback != nil {
+			err = multierror.Append(err, errRollback)
 		}
+		return &database.Error{OrigErr: err, Query: []byte(query)}
+	}
+
+	// Also re-write the schema version for nil dirty versions to prevent
+	// empty schema version for failed down migration on the first migration
+	// See: https://github.com/golang-migrate/migrate/issues/330
+	if version >= 0 || (version == database.NilVersion && dirty) {
+		query = `INSERT INTO ` + pq.QuoteIdentifier(p.config.migrationsSchemaName) + `.` + pq.QuoteIdentifier(p.config.migrationsTableName) + ` (version, dirty) VALUES ($1, $2)`
+		if _, err := tx.Exec(query, version, dirty); err != nil {
+			if errRollback := tx.Rollback(); errRollback != nil {
+				err = multierror.Append(err, errRollback)
+			}
+			return &database.Error{OrigErr: err, Query: []byte(query)}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return &database.Error{OrigErr: err, Err: "transaction commit failed"}
 	}
 
 	return nil
 }
 
-func (c *PgEdge) SetVersion(version int, dirty bool) error {
-	return c.doTxWithRetry(context.Background(), &sql.TxOptions{Isolation: sql.LevelSerializable}, func(tx *sql.Tx) error {
-		fmt.Println("SetVersion() is called")
-		if _, err := tx.Exec(`DELETE FROM "` + c.config.MigrationsTable + `"`); err != nil {
-			return err
-		}
-
-		// Also re-write the schema version for nil dirty versions to prevent
-		// empty schema version for failed down migration on the first migration
-		// See: https://github.com/golang-migrate/migrate/issues/330
-		if version >= 0 || (version == database.NilVersion && dirty) {
-			if _, err := tx.Exec(`INSERT INTO "`+c.config.MigrationsTable+`" (version, dirty) VALUES ($1, $2)`, version, dirty); err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
-}
-
-func (c *PgEdge) Version() (version int, dirty bool, err error) {
-	fmt.Println("Version() is called")
-	query := `SELECT version, dirty FROM "` + c.config.MigrationsTable + `" LIMIT 1`
-	err = c.db.QueryRow(query).Scan(&version, &dirty)
-
+func (p *PgEdge) Version() (version int, dirty bool, err error) {
+	query := `SELECT version, dirty FROM ` + pq.QuoteIdentifier(p.config.migrationsSchemaName) + `.` + pq.QuoteIdentifier(p.config.migrationsTableName) + ` LIMIT 1`
+	err = p.conn.QueryRowContext(context.Background(), query).Scan(&version, &dirty)
 	switch {
 	case err == sql.ErrNoRows:
 		return database.NilVersion, false, nil
 
 	case err != nil:
 		if e, ok := err.(*pq.Error); ok {
-			// 42P01 is "UndefinedTableError" in PgEdge
-			if e.Code == "42P01" {
+			if e.Code.Name() == "undefined_table" {
 				return database.NilVersion, false, nil
 			}
 		}
@@ -394,14 +501,14 @@ func (c *PgEdge) Drop() (err error) {
 
 // ensureVersionTable checks if versions table exists and, if not, creates it.
 // Note that this function locks the database
-func (c *PgEdge) ensureVersionTable() (err error) {
+func (p *PgEdge) ensureVersionTable() (err error) {
 	fmt.Println("ensureVersionTable() is called")
-	if err = c.Lock(); err != nil {
+	if err = p.Lock(); err != nil {
 		return err
 	}
 
 	defer func() {
-		if e := c.Unlock(); e != nil {
+		if e := p.Unlock(); e != nil {
 			if err == nil {
 				err = e
 			} else {
@@ -410,114 +517,27 @@ func (c *PgEdge) ensureVersionTable() (err error) {
 		}
 	}()
 
-	// check if migration table exists
+	// This block checks whether the `MigrationsTable` already exists. This is useful because it allows read only postgres
+	// users to also check the current version of the schema. Previously, even if `MigrationsTable` existed, the
+	// `CREATE TABLE IF NOT EXISTS...` query would fail because the user does not have the CREATE permission.
+	// Taken from https://github.com/mattes/migrate/blob/master/database/postgres/postgres.go#L258
+	query := `SELECT COUNT(1) FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2 LIMIT 1`
+	row := p.conn.QueryRowContext(context.Background(), query, p.config.migrationsSchemaName, p.config.migrationsTableName)
+
 	var count int
-	query := `SELECT COUNT(1) FROM information_schema.tables WHERE table_name = $1 AND table_schema = (SELECT current_schema()) LIMIT 1`
-	if err := c.db.QueryRow(query, c.config.MigrationsTable).Scan(&count); err != nil {
+	err = row.Scan(&count)
+	if err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
+
 	if count == 1 {
 		return nil
 	}
 
-	// if not, create the empty migration table
-	query = `CREATE TABLE "` + c.config.MigrationsTable + `" (version INT NOT NULL PRIMARY KEY, dirty BOOL NOT NULL)`
-	if _, err := c.db.Exec(query); err != nil {
-		return &database.Error{OrigErr: err, Query: []byte(query)}
-	}
-	return nil
-}
-
-func (c *PgEdge) ensureLockTable() error {
-	fmt.Println("ensureLockTable() is called")
-	// check if lock table exists
-	var count int
-	query := `SELECT COUNT(1) FROM information_schema.tables WHERE table_name = $1 AND table_schema = (SELECT current_schema()) LIMIT 1`
-	if err := c.db.QueryRow(query, c.config.LockTable).Scan(&count); err != nil {
-		return &database.Error{OrigErr: err, Query: []byte(query)}
-	}
-	if count == 1 {
-		return nil
-	}
-
-	// if not, create the empty lock table
-	query = `CREATE TABLE "` + c.config.LockTable + `" (lock_id TEXT NOT NULL PRIMARY KEY)`
-	if _, err := c.db.Exec(query); err != nil {
+	query = `CREATE TABLE IF NOT EXISTS ` + pq.QuoteIdentifier(p.config.migrationsSchemaName) + `.` + pq.QuoteIdentifier(p.config.migrationsTableName) + ` (version bigint not null primary key, dirty boolean not null)`
+	if _, err = p.conn.ExecContext(context.Background(), query); err != nil {
 		return &database.Error{OrigErr: err, Query: []byte(query)}
 	}
 
 	return nil
-}
-
-func (c *PgEdge) doTxWithRetry(
-	ctx context.Context,
-	txOpts *sql.TxOptions,
-	fn func(tx *sql.Tx) error,
-) error {
-	fmt.Println("doTxWithRetry() is called")
-	backOff := c.newBackoff(ctx)
-
-	return backoff.Retry(func() error {
-		tx, err := c.db.BeginTx(ctx, txOpts)
-		if err != nil {
-			return backoff.Permanent(err)
-		}
-
-		// If we've tried to commit the transaction Rollback just returns sql.ErrTxDone.
-		//nolint:errcheck
-		defer tx.Rollback()
-
-		if err := fn(tx); err != nil {
-			if errIsRetryable(err) {
-				return err
-			}
-
-			return backoff.Permanent(err)
-		}
-
-		if err := tx.Commit(); err != nil {
-			if errIsRetryable(err) {
-				return err
-			}
-
-			return backoff.Permanent(err)
-		}
-
-		return nil
-	}, backOff)
-}
-
-func (c *PgEdge) newBackoff(ctx context.Context) backoff.BackOff {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	retrier := backoff.WithMaxRetries(backoff.WithContext(&backoff.ExponentialBackOff{
-		InitialInterval:     backoff.DefaultInitialInterval,
-		RandomizationFactor: backoff.DefaultRandomizationFactor,
-		Multiplier:          backoff.DefaultMultiplier,
-		MaxInterval:         c.config.MaxRetryInterval,
-		MaxElapsedTime:      c.config.MaxRetryElapsedTime,
-		Stop:                backoff.Stop,
-		Clock:               backoff.SystemClock,
-	}, ctx), uint64(c.config.MaxRetries))
-
-	retrier.Reset()
-
-	return retrier
-}
-
-func errIsRetryable(err error) bool {
-	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) {
-		return false
-	}
-
-	// Assume that it's safe to retry 08006 and XX000 because we check for lock existence
-	// before creating and lock ID is primary key. Version field in migrations table is primary key too
-	// and delete all versions is an idempotent operation.
-	return pgErr.Code == pgerrcode.SerializationFailure || // optimistic locking conflict
-		pgErr.Code == pgerrcode.DeadlockDetected ||
-		pgErr.Code == pgerrcode.ConnectionFailure || // node down, need to reconnect
-		pgErr.Code == pgerrcode.InternalError // may happen during HA
 }

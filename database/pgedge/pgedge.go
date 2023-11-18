@@ -309,8 +309,8 @@ func (p *PgEdge) runStatement(statement []byte) error {
 		return nil
 	}
 
-	fmt.Println(query, "query")
-	fmt.Println(p.config.migrationsSchemaName, "migrationsSchemaName")
+	query = filterQuery(query)
+	fmt.Println(query, "finalquery")
 	if _, err := p.conn.ExecContext(ctx, query); err != nil {
 		if pgErr, ok := err.(*pq.Error); ok {
 			var line uint
@@ -370,34 +370,23 @@ func runesLastIndex(input []rune, target rune) int {
 	return -1
 }
 
-func filterQuery(query string)(string, error){
-	statements := strings.Split(query, ";")
+func filterQuery(query string) string {
+	// Remove single-line comments
+	re := regexp.MustCompile(`(?m)--.*$`)
+	script := re.ReplaceAllString(query, "")
 
-	for _, stmt := range statements {
-		// Trim whitespace
-		stmt = strings.TrimSpace(stmt)
+	// Remove multi-line comments
+	re = regexp.MustCompile(`(?s)/\*.*?\*/`)
+	script = re.ReplaceAllString(script, "")
 
-		// Skip empty statements and comments
-		if stmt == "" || strings.HasPrefix(stmt, "--") {
-			continue
-		}
+	// Remove empty lines
+	re = regexp.MustCompile(`(?m)^\s*$[\r\n]*|[\r\n]+\s+\z`)
+	script = re.ReplaceAllString(script, "")
 
-		// Check if schema name is present
-		schemaPresent, err := regexp.MatchString(`\w+\.\w+`, stmt)
-		if err != nil {
-			return err
-		}
+	// Wrap all the ddl statements
+	script = fmt.Sprintf("SELECT spock.replicate_ddl('%s');", script)
 
-		// If schema name is not present, prepend default schema to table name
-		if !schemaPresent {
-			stmt = strings.Replace(stmt, "TABLE ", fmt.Sprintf("TABLE %s.", "public"), 1)
-		}
-
-		// Wrap the statement with spock.replicate_ddl
-		query := fmt.Sprintf("SELECT spock.replicate_ddl('%s');", stmt)
-		fmt.Println(query, "query")
-
-}
+	return script
 }
 
 func (p *PgEdge) SetVersion(version int, dirty bool) error {

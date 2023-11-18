@@ -344,12 +344,10 @@ func computeLineFromPos(s string, pos int) (line uint, col uint, ok bool) {
 		return 0, 0, false
 	}
 	sel := runes[:pos]
-	line = uint(runesCount(sel, newLine) + 1)
-	col = uint(pos - 1 - runesLastIndex(sel, newLine))
+	line = uint(runesCount(sel, '\n') + 1)
+	col = uint(pos - 1 - runesLastIndex(sel, '\n'))
 	return line, col, true
 }
-
-const newLine = '\n'
 
 func runesCount(input []rune, target rune) int {
 	var count int

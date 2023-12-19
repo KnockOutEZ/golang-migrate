@@ -1,2 +1,2 @@
-DROP TABLE IF EXISTS northwind.books;
-DROP TABLE IF EXISTS northwind.booksToo;
+DROP TABLE IF EXISTS books;
+DROP TABLE IF EXISTS booksToo;

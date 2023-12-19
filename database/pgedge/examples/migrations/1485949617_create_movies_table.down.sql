@@ -1,1 +1,1 @@
-DROP TABLE IF EXISTS public.movies;
+DROP TABLE IF EXISTS movies;

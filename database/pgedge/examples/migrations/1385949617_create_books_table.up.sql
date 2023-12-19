@@ -3,7 +3,7 @@
 --   primary key(id)
 -- );
 
-CREATE TABLE IF NOT EXISTS northwind.books (
+CREATE TABLE IF NOT EXISTS books (
   id varchar,
   primary key(id)
 );
@@ -14,7 +14,7 @@ user upon signup. Tenants have a single owner, which is a user. Tenants may
 have any number of users, as defined by the memberships table.
  */
 
-CREATE TABLE IF NOT EXISTS northwind.booksToo (
+CREATE TABLE IF NOT EXISTS booksToo (
   id varchar,
   primary key(id)
 );

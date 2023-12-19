@@ -15,7 +15,7 @@ import (
 	"time"
 
 	// "github.com/cenkalti/backoff/v4"
-	"github.com/golang-migrate/migrate/v4"
+	// "github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database"
 	"github.com/golang-migrate/migrate/v4/database/multistmt"
 	"github.com/hashicorp/go-multierror"
@@ -70,6 +70,7 @@ type PgEdge struct {
 }
 
 func WithConnection(ctx context.Context, conn *sql.Conn, config *Config) (*PgEdge, error) {
+	fmt.Println("WithConnection() is called")
 	if config == nil {
 		return nil, ErrNilConfig
 	}
@@ -110,6 +111,8 @@ func WithConnection(ctx context.Context, conn *sql.Conn, config *Config) (*PgEdg
 		config.MigrationsTable = DefaultMigrationsTable
 	}
 
+	fmt.Println(config.DatabaseName, "databaseName")
+
 	config.migrationsSchemaName = config.SchemaName
 	config.migrationsTableName = config.MigrationsTable
 	if config.MigrationsTableQuoted {
@@ -136,6 +139,7 @@ func WithConnection(ctx context.Context, conn *sql.Conn, config *Config) (*PgEdg
 }
 
 func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
+	fmt.Println("WithInstance() is called")
 	ctx := context.Background()
 
 	if err := instance.Ping(); err != nil {
@@ -156,78 +160,106 @@ func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
 }
 
 func (p *PgEdge) Open(dbURL string) (database.Driver, error) {
-	purl, err := url.Parse(dbURL)
-	if err != nil {
-		return nil, err
-	}
+	fmt.Println("Open() is called")
+
+	var px database.Driver
+
+	fmt.Println(dbURL, "dbURL")
 
 	// As PgEdge uses the postgres protocol, and 'postgres' is already a registered database, we need to replace the
 	// connect prefix, with the actual protocol, so that the library can differentiate between the implementations
 	re := regexp.MustCompile("^(pgedge)")
-	connectString := re.ReplaceAllString(migrate.FilterCustomQuery(purl).String(), "postgres")
+	// connectString := re.ReplaceAllString(migrate.FilterCustomQuery(purl).String(), "postgres")
+	connectString := re.ReplaceAllString(dbURL, "postgres")
 
-	db, err := sql.Open("postgres", connectString)
+	decodedString, err := url.QueryUnescape(connectString)
 	if err != nil {
 		return nil, err
 	}
 
-	migrationsTable := purl.Query().Get("x-migrations-table")
-	migrationsTableQuoted := false
-	if s := purl.Query().Get("x-migrations-table-quoted"); len(s) > 0 {
-		migrationsTableQuoted, err = strconv.ParseBool(s)
-		if err != nil {
-			return nil, fmt.Errorf("Unable to parse option x-migrations-table-quoted: %w", err)
-		}
-	}
-	if (len(migrationsTable) > 0) && (migrationsTableQuoted) && ((migrationsTable[0] != '"') || (migrationsTable[len(migrationsTable)-1] != '"')) {
-		return nil, fmt.Errorf("x-migrations-table must be quoted (for instance '\"migrate\".\"schema_migrations\"') when x-migrations-table-quoted is enabled, current value is: %s", migrationsTable)
-	}
+	connectionStrings := strings.Split(decodedString, ",")
 
-	statementTimeoutString := purl.Query().Get("x-statement-timeout")
-	statementTimeout := 0
-	if statementTimeoutString != "" {
-		statementTimeout, err = strconv.Atoi(statementTimeoutString)
+	fmt.Println(connectionStrings[0], "connectionStrings")
+	fmt.Println("------------------------------------")
+	fmt.Println(connectionStrings[1], "connectionStrings")
+	fmt.Println("------------------------------------")
+	fmt.Println(connectionStrings[2], "connectionStrings")
+
+	for _, dbURL := range connectionStrings {
+		db, err := sql.Open("postgres", dbURL)
+		if err != nil {
+			return nil, err
+		}
+
+		purl, err := url.Parse(dbURL)
+		if err != nil {
+			return nil, err
+		}
+
+		fmt.Println(purl, "purl")
+
+		migrationsTable := purl.Query().Get("x-migrations-table")
+		migrationsTableQuoted := false
+		if s := purl.Query().Get("x-migrations-table-quoted"); len(s) > 0 {
+			migrationsTableQuoted, err = strconv.ParseBool(s)
+			if err != nil {
+				return nil, fmt.Errorf("Unable to parse option x-migrations-table-quoted: %w", err)
+			}
+		}
+		if (len(migrationsTable) > 0) && (migrationsTableQuoted) && ((migrationsTable[0] != '"') || (migrationsTable[len(migrationsTable)-1] != '"')) {
+			return nil, fmt.Errorf("x-migrations-table must be quoted (for instance '\"migrate\".\"schema_migrations\"') when x-migrations-table-quoted is enabled, current value is: %s", migrationsTable)
+		}
+
+		statementTimeoutString := purl.Query().Get("x-statement-timeout")
+		statementTimeout := 0
+		if statementTimeoutString != "" {
+			statementTimeout, err = strconv.Atoi(statementTimeoutString)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		multiStatementMaxSize := DefaultMultiStatementMaxSize
+		if s := purl.Query().Get("x-multi-statement-max-size"); len(s) > 0 {
+			multiStatementMaxSize, err = strconv.Atoi(s)
+			if err != nil {
+				return nil, err
+			}
+			if multiStatementMaxSize <= 0 {
+				multiStatementMaxSize = DefaultMultiStatementMaxSize
+			}
+		}
+
+		multiStatementEnabled := false
+		if s := purl.Query().Get("x-multi-statement"); len(s) > 0 {
+			multiStatementEnabled, err = strconv.ParseBool(s)
+			if err != nil {
+				return nil, fmt.Errorf("Unable to parse option x-multi-statement: %w", err)
+			}
+		}
+
+		fmt.Println(purl.Path, "migrationsTable")
+		px, err = WithInstance(db, &Config{
+			DatabaseName:          purl.Path,
+			MigrationsTable:       migrationsTable,
+			MigrationsTableQuoted: migrationsTableQuoted,
+			StatementTimeout:      time.Duration(statementTimeout) * time.Millisecond,
+			MultiStatementEnabled: multiStatementEnabled,
+			MultiStatementMaxSize: multiStatementMaxSize,
+		})
+
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	multiStatementMaxSize := DefaultMultiStatementMaxSize
-	if s := purl.Query().Get("x-multi-statement-max-size"); len(s) > 0 {
-		multiStatementMaxSize, err = strconv.Atoi(s)
-		if err != nil {
-			return nil, err
-		}
-		if multiStatementMaxSize <= 0 {
-			multiStatementMaxSize = DefaultMultiStatementMaxSize
-		}
-	}
-
-	multiStatementEnabled := false
-	if s := purl.Query().Get("x-multi-statement"); len(s) > 0 {
-		multiStatementEnabled, err = strconv.ParseBool(s)
-		if err != nil {
-			return nil, fmt.Errorf("Unable to parse option x-multi-statement: %w", err)
-		}
-	}
-
-	px, err := WithInstance(db, &Config{
-		DatabaseName:          purl.Path,
-		MigrationsTable:       migrationsTable,
-		MigrationsTableQuoted: migrationsTableQuoted,
-		StatementTimeout:      time.Duration(statementTimeout) * time.Millisecond,
-		MultiStatementEnabled: multiStatementEnabled,
-		MultiStatementMaxSize: multiStatementMaxSize,
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
+	fmt.Printf("%+v\n", px)
+	fmt.Println("-------------------px--------------------")
 	return px, nil
 }
 
 func (p *PgEdge) Close() error {
+	fmt.Println("Close() is called")
 	connErr := p.conn.Close()
 	var dbErr error
 	if p.db != nil {
@@ -242,6 +274,7 @@ func (p *PgEdge) Close() error {
 
 // Locking is done manually with a separate lock table. Implementing advisory locks in PgEdge is being discussed
 func (p *PgEdge) Lock() error {
+	fmt.Println("Lock() is called")
 	return database.CasRestoreOnErr(&p.isLocked, false, true, database.ErrLocked, func() error {
 		aid, err := database.GenerateAdvisoryLockId(p.config.DatabaseName, p.config.migrationsSchemaName, p.config.migrationsTableName)
 		if err != nil {
@@ -260,6 +293,7 @@ func (p *PgEdge) Lock() error {
 
 // Locking is done manually with a separate lock table. Implementing advisory locks in PgEdge is being discussed
 func (p *PgEdge) Unlock() error {
+	fmt.Println("Unlock() is called")
 	return database.CasRestoreOnErr(&p.isLocked, true, false, database.ErrNotLocked, func() error {
 		aid, err := database.GenerateAdvisoryLockId(p.config.DatabaseName, p.config.migrationsSchemaName, p.config.migrationsTableName)
 		if err != nil {
@@ -296,8 +330,8 @@ func (p *PgEdge) Run(migration io.Reader) error {
 }
 
 func (p *PgEdge) runStatement(statement []byte) error {
-	ctx := context.Background()
 	fmt.Println("runStatement() is called")
+	ctx := context.Background()
 	if p.config.StatementTimeout != 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, p.config.StatementTimeout)
@@ -382,12 +416,13 @@ func filterQuery(query string) string {
 	script = re.ReplaceAllString(script, "")
 
 	// Wrap all the ddl statements
-	script = fmt.Sprintf("SELECT spock.replicate_ddl('%s');", script)
+	// script = fmt.Sprintf("SELECT spock.replicate_ddl('%s');", script)
 
 	return script
 }
 
 func (p *PgEdge) SetVersion(version int, dirty bool) error {
+	fmt.Println("SetVersion() is called")
 	tx, err := p.conn.BeginTx(context.Background(), &sql.TxOptions{})
 	if err != nil {
 		return &database.Error{OrigErr: err, Err: "transaction start failed"}
@@ -422,6 +457,7 @@ func (p *PgEdge) SetVersion(version int, dirty bool) error {
 }
 
 func (p *PgEdge) Version() (version int, dirty bool, err error) {
+	fmt.Println("SetVersion() is called")
 	query := `SELECT version, dirty FROM ` + pq.QuoteIdentifier(p.config.migrationsSchemaName) + `.` + pq.QuoteIdentifier(p.config.migrationsTableName) + ` LIMIT 1`
 	err = p.conn.QueryRowContext(context.Background(), query).Scan(&version, &dirty)
 	switch {

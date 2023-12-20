@@ -604,7 +604,8 @@ func (p *PgEdge) Drop() (err error) {
 
 		// Drop each table
 		for _, t := range tables {
-			query = `select spock.replicate_ddl('DROP TABLE IF EXISTS ` + t.Schema + `.` + t.Table + `;')` //CASCADE
+			// query = `select spock.replicate_ddl('DROP TABLE IF EXISTS ` + t.Schema + `.` + t.Table + `;')` //CASCADE
+			query = `DROP TABLE IF EXISTS ` + t.Schema + `.` + t.Table + `;` //CASCADE
 			fmt.Println(query, "query", t.Table, "schema", t.Schema)                                       // log the schema name here
 			if _, err := db.Exec(query); err != nil {
 				errs = append(errs, &database.Error{OrigErr: err, Query: []byte(query)})

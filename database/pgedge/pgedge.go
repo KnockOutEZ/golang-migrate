@@ -61,108 +61,111 @@ type Config struct {
 }
 
 type PgEdge struct {
-	conn     *sql.Conn
-	db       *sql.DB
-	isLocked atomic.Bool
+	conns    []*sql.Conn
+	dbs      []*sql.DB
+	isLocked []atomic.Bool
 
 	// Open and WithInstance need to guarantee that config is never nil
-	config *Config
+	config []*Config
 }
 
-func WithConnection(ctx context.Context, conn *sql.Conn, config *Config) (*PgEdge, error) {
-	fmt.Println("WithConnection() is called")
-	if config == nil {
-		return nil, ErrNilConfig
-	}
+func prepend[T any](slice []T, elems ...T) []T {
+	return append(elems, slice...)
+}
 
-	if err := conn.PingContext(ctx); err != nil {
-		return nil, err
-	}
+func WithInstance(instances []*sql.DB, config []*Config) (database.Driver, error) {
+	fmt.Println("WithInstance() is called")
+	ctx := context.Background()
+	conns := make([]*sql.Conn, 0, len(instances))
+	isLocked := make([]atomic.Bool, len(instances))
 
-	if config.DatabaseName == "" {
-		query := `SELECT CURRENT_DATABASE()`
-		var databaseName string
-		if err := conn.QueryRowContext(ctx, query).Scan(&databaseName); err != nil {
-			return nil, &database.Error{OrigErr: err, Query: []byte(query)}
+	for i, instance := range instances {
+		if err := instance.Ping(); err != nil {
+			return nil, err
 		}
 
-		if len(databaseName) == 0 {
-			return nil, ErrNoDatabaseName
+		conn, err := instance.Conn(ctx)
+		if err != nil {
+			return nil, err
 		}
 
-		config.DatabaseName = databaseName
-	}
-
-	if config.SchemaName == "" {
-		query := `SELECT CURRENT_SCHEMA()`
-		var schemaName sql.NullString
-		if err := conn.QueryRowContext(ctx, query).Scan(&schemaName); err != nil {
-			return nil, &database.Error{OrigErr: err, Query: []byte(query)}
+		if config == nil {
+			return nil, ErrNilConfig
 		}
 
-		if !schemaName.Valid {
-			return nil, ErrNoSchema
+		if err := conn.PingContext(ctx); err != nil {
+			return nil, err
 		}
 
-		config.SchemaName = schemaName.String
-	}
+		if config[i].DatabaseName == "" {
+			query := `SELECT CURRENT_DATABASE()`
+			var databaseName string
+			if err := conn.QueryRowContext(ctx, query).Scan(&databaseName); err != nil {
+				return nil, &database.Error{OrigErr: err, Query: []byte(query)}
+			}
 
-	if len(config.MigrationsTable) == 0 {
-		config.MigrationsTable = DefaultMigrationsTable
-	}
+			if len(databaseName) == 0 {
+				return nil, ErrNoDatabaseName
+			}
 
-	fmt.Println(config.DatabaseName, "databaseName")
-
-	config.migrationsSchemaName = config.SchemaName
-	config.migrationsTableName = config.MigrationsTable
-	if config.MigrationsTableQuoted {
-		re := regexp.MustCompile(`"(.*?)"`)
-		result := re.FindAllStringSubmatch(config.MigrationsTable, -1)
-		config.migrationsTableName = result[len(result)-1][1]
-		if len(result) == 2 {
-			config.migrationsSchemaName = result[0][1]
-		} else if len(result) > 2 {
-			return nil, fmt.Errorf("\"%s\" MigrationsTable contains too many dot characters", config.MigrationsTable)
+			config[i].DatabaseName = databaseName
 		}
+
+		if config[i].SchemaName == "" {
+			query := `SELECT CURRENT_SCHEMA()`
+			var schemaName sql.NullString
+			if err := conn.QueryRowContext(ctx, query).Scan(&schemaName); err != nil {
+				return nil, &database.Error{OrigErr: err, Query: []byte(query)}
+			}
+
+			if !schemaName.Valid {
+				return nil, ErrNoSchema
+			}
+
+			config[i].SchemaName = schemaName.String
+		}
+
+		if len(config[i].MigrationsTable) == 0 {
+			config[i].MigrationsTable = DefaultMigrationsTable
+		}
+
+		fmt.Println(config[i].DatabaseName, "databaseName")
+
+		config[i].migrationsSchemaName = config[i].SchemaName
+		config[i].migrationsTableName = config[i].MigrationsTable
+		if config[i].MigrationsTableQuoted {
+			re := regexp.MustCompile(`"(.*?)"`)
+			result := re.FindAllStringSubmatch(config[i].MigrationsTable, -1)
+			config[i].migrationsTableName = result[len(result)-1][1]
+			if len(result) == 2 {
+				config[i].migrationsSchemaName = result[0][1]
+			} else if len(result) > 2 {
+				return nil, fmt.Errorf("\"%s\" MigrationsTable contains too many dot characters", config[i].MigrationsTable)
+			}
+		}
+
+		conns = append(conns, conn)
 	}
 
 	px := &PgEdge{
-		conn:   conn,
-		config: config,
+		conns:    conns,
+		config:   config,
+		dbs:      instances,
+		isLocked: isLocked,
 	}
+
+	fmt.Println(&px.conns, "px.conns")
 
 	if err := px.ensureVersionTable(); err != nil {
 		return nil, err
 	}
+	fmt.Println(&px.conns, "px.conns")
 
-	return px, nil
-}
-
-func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
-	fmt.Println("WithInstance() is called")
-	ctx := context.Background()
-
-	if err := instance.Ping(); err != nil {
-		return nil, err
-	}
-
-	conn, err := instance.Conn(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	px, err := WithConnection(ctx, conn, config)
-	if err != nil {
-		return nil, err
-	}
-	px.db = instance
 	return px, nil
 }
 
 func (p *PgEdge) Open(dbURL string) (database.Driver, error) {
 	fmt.Println("Open() is called")
-
-	var px database.Driver
 
 	fmt.Println(dbURL, "dbURL")
 
@@ -185,6 +188,10 @@ func (p *PgEdge) Open(dbURL string) (database.Driver, error) {
 	fmt.Println("------------------------------------")
 	fmt.Println(connectionStrings[2], "connectionStrings")
 
+	dbs := make([]*sql.DB, 0, len(connectionStrings))
+	configs := make([]*Config, 0, len(connectionStrings))
+	fmt.Println(connectionStrings, "connectionStrings", len(connectionStrings))
+
 	for _, dbURL := range connectionStrings {
 		db, err := sql.Open("postgres", dbURL)
 		if err != nil {
@@ -199,6 +206,7 @@ func (p *PgEdge) Open(dbURL string) (database.Driver, error) {
 		fmt.Println(purl, "purl")
 
 		migrationsTable := purl.Query().Get("x-migrations-table")
+
 		migrationsTableQuoted := false
 		if s := purl.Query().Get("x-migrations-table-quoted"); len(s) > 0 {
 			migrationsTableQuoted, err = strconv.ParseBool(s)
@@ -238,19 +246,27 @@ func (p *PgEdge) Open(dbURL string) (database.Driver, error) {
 			}
 		}
 
-		fmt.Println(purl.Path, "migrationsTable")
-		px, err = WithInstance(db, &Config{
-			DatabaseName:          purl.Path,
+		dbs = append(dbs, db)
+		configs = append(configs, &Config{
 			MigrationsTable:       migrationsTable,
 			MigrationsTableQuoted: migrationsTableQuoted,
-			StatementTimeout:      time.Duration(statementTimeout) * time.Millisecond,
 			MultiStatementEnabled: multiStatementEnabled,
+			DatabaseName:          purl.Path,
+			SchemaName:            purl.Query().Get("x-schema-name"),
+			StatementTimeout:      time.Duration(statementTimeout) * time.Millisecond,
 			MultiStatementMaxSize: multiStatementMaxSize,
 		})
 
-		if err != nil {
-			return nil, err
-		}
+		fmt.Println(purl.Path, "migrationsTable")
+
+		fmt.Println(p, "px")
+	}
+	fmt.Println(dbs, "dbs", len(dbs))
+	fmt.Println(configs, "configs", len(configs))
+	px, err := WithInstance(dbs, configs)
+
+	if err != nil {
+		return nil, err
 	}
 
 	fmt.Printf("%+v\n", px)
@@ -260,14 +276,20 @@ func (p *PgEdge) Open(dbURL string) (database.Driver, error) {
 
 func (p *PgEdge) Close() error {
 	fmt.Println("Close() is called")
-	connErr := p.conn.Close()
-	var dbErr error
-	if p.db != nil {
-		dbErr = p.db.Close()
-	}
+	var errs []error
+	for i, conn := range p.conns {
+		connErr := conn.Close()
+		var dbErr error
+		if p.dbs[i] != nil {
+			dbErr = p.dbs[i].Close()
+		}
 
-	if connErr != nil || dbErr != nil {
-		return fmt.Errorf("conn: %v, db: %v", connErr, dbErr)
+		if connErr != nil || dbErr != nil {
+			errs = append(errs, fmt.Errorf("conn: %v, db: %v", connErr, dbErr))
+		}
+	}
+	if len(errs) > 0 {
+		return multierror.Append(errs[0], errs[1:]...)
 	}
 	return nil
 }
@@ -275,77 +297,127 @@ func (p *PgEdge) Close() error {
 // Locking is done manually with a separate lock table. Implementing advisory locks in PgEdge is being discussed
 func (p *PgEdge) Lock() error {
 	fmt.Println("Lock() is called")
-	return database.CasRestoreOnErr(&p.isLocked, false, true, database.ErrLocked, func() error {
-		aid, err := database.GenerateAdvisoryLockId(p.config.DatabaseName, p.config.migrationsSchemaName, p.config.migrationsTableName)
+	var errs []error
+	fmt.Println(p.conns, "p.conns")
+	fmt.Println(p.config, "p.config")
+	if len(p.isLocked) == 0 {
+		return fmt.Errorf("p.isLocked is empty")
+	}
+	for i, conn := range p.conns {
+		// if p.config[i].DatabaseName == "" || p.config[i].migrationsSchemaName == "" || p.config[i].migrationsTableName == "" {
+		// return fmt.Errorf("database name, schema name, or table name is empty")
+		fmt.Println(p.config[i].DatabaseName, p.config[i].migrationsSchemaName, p.config[i].migrationsTableName, "p.config[i].DatabaseName, p.config[i].migrationsSchemaName, p.config[i].migrationsTableName")
+		// }
+		err := database.CasRestoreOnErr(&p.isLocked[i], false, true, database.ErrLocked, func() error {
+			fmt.Println(p.config[i].DatabaseName, "p.config[i].DatabaseName")
+			aid, err := database.GenerateAdvisoryLockId(p.config[i].DatabaseName, p.config[i].migrationsSchemaName, p.config[i].migrationsTableName)
+			if err != nil {
+				return err
+			}
+
+			// This will wait indefinitely until the lock can be acquired.
+			query := `SELECT pg_advisory_lock($1)`
+			if _, err := conn.ExecContext(context.Background(), query, aid); err != nil {
+				return &database.Error{OrigErr: err, Err: "try lock failed", Query: []byte(query)}
+			}
+
+			return nil
+		})
+		fmt.Println(err, "err")
 		if err != nil {
-			return err
+			errs = append(errs, err)
 		}
-
-		// This will wait indefinitely until the lock can be acquired.
-		query := `SELECT pg_advisory_lock($1)`
-		if _, err := p.conn.ExecContext(context.Background(), query, aid); err != nil {
-			return &database.Error{OrigErr: err, Err: "try lock failed", Query: []byte(query)}
-		}
-
-		return nil
-	})
+	}
+	if len(errs) > 0 {
+		return multierror.Append(errs[0], errs[1:]...)
+	}
+	return nil
 }
 
 // Locking is done manually with a separate lock table. Implementing advisory locks in PgEdge is being discussed
 func (p *PgEdge) Unlock() error {
 	fmt.Println("Unlock() is called")
-	return database.CasRestoreOnErr(&p.isLocked, true, false, database.ErrNotLocked, func() error {
-		aid, err := database.GenerateAdvisoryLockId(p.config.DatabaseName, p.config.migrationsSchemaName, p.config.migrationsTableName)
-		if err != nil {
-			return err
+	var errs []error
+	for i, conn := range p.conns {
+		if p.config[i].DatabaseName == "" || p.config[i].migrationsSchemaName == "" || p.config[i].migrationsTableName == "" {
+			return fmt.Errorf("database name, schema name, or table name is empty")
 		}
+		fmt.Print(p.config[i].DatabaseName, "tablename")
+		err := database.CasRestoreOnErr(&p.isLocked[i], true, false, database.ErrNotLocked, func() error {
+			aid, err := database.GenerateAdvisoryLockId(p.config[i].DatabaseName, p.config[i].migrationsSchemaName, p.config[i].migrationsTableName)
+			if err != nil {
+				return err
+			}
 
-		query := `SELECT pg_advisory_unlock($1)`
-		if _, err := p.conn.ExecContext(context.Background(), query, aid); err != nil {
-			return &database.Error{OrigErr: err, Query: []byte(query)}
+			query := `SELECT pg_advisory_unlock($1)`
+			if _, err := conn.ExecContext(context.Background(), query, aid); err != nil {
+				return &database.Error{OrigErr: err, Err: "try unlock failed", Query: []byte(query)}
+			}
+			return nil
+		})
+		if err != nil {
+			errs = append(errs, err)
 		}
-		return nil
-	})
+	}
+	if len(errs) > 0 {
+		return multierror.Append(errs[0], errs[1:]...)
+	}
+	return nil
 }
 
 func (p *PgEdge) Run(migration io.Reader) error {
 	fmt.Println("Run() is called")
-	if p.config.MultiStatementEnabled {
-		var err error
-		if e := multistmt.Parse(migration, multiStmtDelimiter, p.config.MultiStatementMaxSize, func(m []byte) bool {
-			if err = p.runStatement(m); err != nil {
-				return false
-			}
-			return true
-		}); e != nil {
-			return e
-		}
-		return err
-	}
+	fmt.Println(p.conns, "px.conns", len(p.conns))
+	var errs []error
 	migr, err := io.ReadAll(migration)
-	if err != nil {
-		return err
+	for i, conn := range p.conns {
+		fmt.Println(migration, "migration",i)
+		if p.config[i].MultiStatementEnabled {
+			var err error
+			if e := multistmt.Parse(migration, multiStmtDelimiter, p.config[i].MultiStatementMaxSize, func(m []byte) bool {
+				if err = p.runStatement(m, conn, p.config[i]); err != nil {
+					return false
+				}
+				return true
+			}); e != nil {
+				errs = append(errs, e)
+			}
+			if err != nil {
+				errs = append(errs, err)
+			}
+		} else {
+			
+				fmt.Println("migr",migr)
+				err = p.runStatement(migr, conn, p.config[i])
+				if err != nil {
+					errs = append(errs, err)
+				}
+			}
 	}
-	return p.runStatement(migr)
+	if len(errs) > 0 {
+		return multierror.Append(errs[0], errs[1:]...)
+	}
+	return nil
 }
 
-func (p *PgEdge) runStatement(statement []byte) error {
+func (p *PgEdge) runStatement(statement []byte, conn *sql.Conn, config *Config) error {
 	fmt.Println("runStatement() is called")
 	ctx := context.Background()
-	if p.config.StatementTimeout != 0 {
+	if config.StatementTimeout != 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, p.config.StatementTimeout)
+		ctx, cancel = context.WithTimeout(ctx, config.StatementTimeout)
 		defer cancel()
 	}
 
 	query := string(statement)
 	if strings.TrimSpace(query) == "" {
+		fmt.Println("empty query")
 		return nil
 	}
 
 	query = filterQuery(query)
 	fmt.Println(query, "finalquery")
-	if _, err := p.conn.ExecContext(ctx, query); err != nil {
+	if _, err := conn.ExecContext(ctx, query); err != nil {
 		if pgErr, ok := err.(*pq.Error); ok {
 			var line uint
 			var col uint
@@ -423,102 +495,125 @@ func filterQuery(query string) string {
 
 func (p *PgEdge) SetVersion(version int, dirty bool) error {
 	fmt.Println("SetVersion() is called")
-	tx, err := p.conn.BeginTx(context.Background(), &sql.TxOptions{})
-	if err != nil {
-		return &database.Error{OrigErr: err, Err: "transaction start failed"}
-	}
-
-	query := `TRUNCATE ` + pq.QuoteIdentifier(p.config.migrationsSchemaName) + `.` + pq.QuoteIdentifier(p.config.migrationsTableName)
-	if _, err := tx.Exec(query); err != nil {
-		if errRollback := tx.Rollback(); errRollback != nil {
-			err = multierror.Append(err, errRollback)
+	var errs []error
+	for i, conn := range p.conns {
+		tx, err := conn.BeginTx(context.Background(), &sql.TxOptions{})
+		if err != nil {
+			errs = append(errs, &database.Error{OrigErr: err, Err: "transaction start failed"})
+			continue
 		}
-		return &database.Error{OrigErr: err, Query: []byte(query)}
-	}
 
-	// Also re-write the schema version for nil dirty versions to prevent
-	// empty schema version for failed down migration on the first migration
-	// See: https://github.com/golang-migrate/migrate/issues/330
-	if version >= 0 || (version == database.NilVersion && dirty) {
-		query = `INSERT INTO ` + pq.QuoteIdentifier(p.config.migrationsSchemaName) + `.` + pq.QuoteIdentifier(p.config.migrationsTableName) + ` (version, dirty) VALUES ($1, $2)`
-		if _, err := tx.Exec(query, version, dirty); err != nil {
+		query := `TRUNCATE ` + pq.QuoteIdentifier(p.config[i].migrationsSchemaName) + `.` + pq.QuoteIdentifier(p.config[i].migrationsTableName)
+		if _, err := tx.Exec(query); err != nil {
 			if errRollback := tx.Rollback(); errRollback != nil {
 				err = multierror.Append(err, errRollback)
 			}
-			return &database.Error{OrigErr: err, Query: []byte(query)}
+			errs = append(errs, &database.Error{OrigErr: err, Query: []byte(query)})
+			continue
 		}
-	}
 
-	if err := tx.Commit(); err != nil {
-		return &database.Error{OrigErr: err, Err: "transaction commit failed"}
-	}
-
-	return nil
-}
-
-func (p *PgEdge) Version() (version int, dirty bool, err error) {
-	fmt.Println("SetVersion() is called")
-	query := `SELECT version, dirty FROM ` + pq.QuoteIdentifier(p.config.migrationsSchemaName) + `.` + pq.QuoteIdentifier(p.config.migrationsTableName) + ` LIMIT 1`
-	err = p.conn.QueryRowContext(context.Background(), query).Scan(&version, &dirty)
-	switch {
-	case err == sql.ErrNoRows:
-		return database.NilVersion, false, nil
-
-	case err != nil:
-		if e, ok := err.(*pq.Error); ok {
-			if e.Code.Name() == "undefined_table" {
-				return database.NilVersion, false, nil
+		// Also re-write the schema version for nil dirty versions to prevent
+		// empty schema version for failed down migration on the first migration
+		// See: https://github.com/golang-migrate/migrate/issues/330
+		if version >= 0 || (version == database.NilVersion && dirty) {
+			query = `INSERT INTO ` + pq.QuoteIdentifier(p.config[i].migrationsSchemaName) + `.` + pq.QuoteIdentifier(p.config[i].migrationsTableName) + ` (version, dirty) VALUES ($1, $2)`
+			if _, err := tx.Exec(query, version, dirty); err != nil {
+				if errRollback := tx.Rollback(); errRollback != nil {
+					err = multierror.Append(err, errRollback)
+				}
+				errs = append(errs, &database.Error{OrigErr: err, Query: []byte(query)})
+				continue
 			}
 		}
-		return 0, false, &database.Error{OrigErr: err, Query: []byte(query)}
 
-	default:
-		return version, dirty, nil
+		if err := tx.Commit(); err != nil {
+			errs = append(errs, &database.Error{OrigErr: err, Err: "transaction commit failed"})
+		}
 	}
+	if len(errs) > 0 {
+		return multierror.Append(errs[0], errs[1:]...)
+	}
+	return nil
+}
+func (p *PgEdge) Version() (version int, dirty bool, err error) {
+	fmt.Println("SetVersion() is called")
+	var errs []error
+	for i, conn := range p.conns {
+		query := `SELECT version, dirty FROM ` + pq.QuoteIdentifier(p.config[i].migrationsSchemaName) + `.` + pq.QuoteIdentifier(p.config[i].migrationsTableName) + ` LIMIT 1`
+		err = conn.QueryRowContext(context.Background(), query).Scan(&version, &dirty)
+		switch {
+		case err == sql.ErrNoRows:
+			return database.NilVersion, false, nil
+
+		case err != nil:
+			if e, ok := err.(*pq.Error); ok {
+				if e.Code.Name() == "undefined_table" {
+					return database.NilVersion, false, nil
+				}
+			}
+			errs = append(errs, &database.Error{OrigErr: err, Query: []byte(query)})
+			continue
+
+		default:
+			return version, dirty, nil
+		}
+	}
+	if len(errs) > 0 {
+		return 0, false, multierror.Append(errs[0], errs[1:]...)
+	}
+	return version, dirty, nil
 }
 
-func (c *PgEdge) Drop() (err error) {
+func (p *PgEdge) Drop() (err error) {
 	fmt.Println("Drop() is called")
-	query := `SELECT table_schema, table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema','spock') AND table_schema NOT LIKE 'pg_toast%';`
-	rows, err := c.db.Query(query)
-	if err != nil {
-		return &database.Error{OrigErr: err, Query: []byte(query)}
-	}
-	defer func() {
-		if errClose := rows.Close(); errClose != nil {
-			err = multierror.Append(err, errClose)
+	var errs []error
+	for _, db := range p.dbs {
+		query := `SELECT table_schema, table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema','spock') AND table_schema NOT LIKE 'pg_toast%';`
+		rows, err := db.Query(query)
+		if err != nil {
+			errs = append(errs, &database.Error{OrigErr: err, Query: []byte(query)})
+			continue
 		}
-	}()
+		defer func() {
+			if errClose := rows.Close(); errClose != nil {
+				err = multierror.Append(err, errClose)
+			}
+		}()
 
-	// Store schema and table names
-	tables := make([]struct {
-		Schema string
-		Table  string
-	}, 0)
-
-	for rows.Next() {
-		var schema, table string
-		if err := rows.Scan(&schema, &table); err != nil {
-			return err
-		}
-		tables = append(tables, struct {
+		// Store schema and table names
+		tables := make([]struct {
 			Schema string
 			Table  string
-		}{Schema: schema, Table: table})
-	}
-	if err := rows.Err(); err != nil {
-		return &database.Error{OrigErr: err, Query: []byte(query)}
-	}
+		}, 0)
 
-	// Drop each table
-	for _, t := range tables {
-		query = `select spock.replicate_ddl('DROP TABLE IF EXISTS ` + t.Schema + `.` + t.Table + `;')` //CASCADE
-		fmt.Println(query, "query", t.Table, "schema", t.Schema)                                       // log the schema name here
-		if _, err := c.db.Exec(query); err != nil {
-			return &database.Error{OrigErr: err, Query: []byte(query)}
+		for rows.Next() {
+			var schema, table string
+			if err := rows.Scan(&schema, &table); err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			tables = append(tables, struct {
+				Schema string
+				Table  string
+			}{Schema: schema, Table: table})
+		}
+		if err := rows.Err(); err != nil {
+			errs = append(errs, &database.Error{OrigErr: err, Query: []byte(query)})
+			continue
+		}
+
+		// Drop each table
+		for _, t := range tables {
+			query = `select spock.replicate_ddl('DROP TABLE IF EXISTS ` + t.Schema + `.` + t.Table + `;')` //CASCADE
+			fmt.Println(query, "query", t.Table, "schema", t.Schema)                                       // log the schema name here
+			if _, err := db.Exec(query); err != nil {
+				errs = append(errs, &database.Error{OrigErr: err, Query: []byte(query)})
+			}
 		}
 	}
-
+	if len(errs) > 0 {
+		return multierror.Append(errs[0], errs[1:]...)
+	}
 	return nil
 }
 
@@ -544,23 +639,30 @@ func (p *PgEdge) ensureVersionTable() (err error) {
 	// users to also check the current version of the schema. Previously, even if `MigrationsTable` existed, the
 	// `CREATE TABLE IF NOT EXISTS...` query would fail because the user does not have the CREATE permission.
 	// Taken from https://github.com/mattes/migrate/blob/master/database/postgres/postgres.go#L258
-	query := `SELECT COUNT(1) FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2 LIMIT 1`
-	row := p.conn.QueryRowContext(context.Background(), query, p.config.migrationsSchemaName, p.config.migrationsTableName)
+	var errs []error
+	for i, conn := range p.conns {
+		fmt.Println(p.config[i].migrationsSchemaName, p.config[i].migrationsTableName, p.config[i].migrationsSchemaName, "p.config[i].migrationsSchemaName, p.config[i].migrationsTableName,p.config[i].migrationsSchemaName")
+		query := `SELECT COUNT(1) FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2 LIMIT 1`
+		row := conn.QueryRowContext(context.Background(), query, p.config[i].migrationsSchemaName, p.config[i].migrationsTableName)
 
-	var count int
-	err = row.Scan(&count)
-	if err != nil {
-		return &database.Error{OrigErr: err, Query: []byte(query)}
+		var count int
+		err = row.Scan(&count)
+		if err != nil {
+			errs = append(errs, &database.Error{OrigErr: err, Query: []byte(query)})
+			continue
+		}
+
+		if count == 1 {
+			continue
+		}
+
+		query = `CREATE TABLE IF NOT EXISTS ` + pq.QuoteIdentifier(p.config[i].migrationsSchemaName) + `.` + pq.QuoteIdentifier(p.config[i].migrationsTableName) + ` (version bigint not null primary key, dirty boolean not null)`
+		if _, err = conn.ExecContext(context.Background(), query); err != nil {
+			errs = append(errs, &database.Error{OrigErr: err, Query: []byte(query)})
+		}
 	}
-
-	if count == 1 {
-		return nil
+	if len(errs) > 0 {
+		return multierror.Append(errs[0], errs[1:]...)
 	}
-
-	query = `CREATE TABLE IF NOT EXISTS ` + pq.QuoteIdentifier(p.config.migrationsSchemaName) + `.` + pq.QuoteIdentifier(p.config.migrationsTableName) + ` (version bigint not null primary key, dirty boolean not null)`
-	if _, err = p.conn.ExecContext(context.Background(), query); err != nil {
-		return &database.Error{OrigErr: err, Query: []byte(query)}
-	}
-
 	return nil
 }
